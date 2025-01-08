@@ -1,0 +1,14 @@
+pragma compiler_version >= 0.20.0;
+
+import CompactStandardLibrary;
+
+export ledger round: Counter;
+export ledger test: Cell<Bytes<32>>;
+export ledger uint_number: Cell<Uint<64>>;
+export ledger ts_number: Uint<32>;
+
+constructor() {
+  test = 2c45f89bb
+  uint_number = 420
+  ts_number = 123
+}
