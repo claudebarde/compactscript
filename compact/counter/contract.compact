@@ -12,3 +12,6 @@ constructor() {
   uint_number = 420
   ts_number = 123
 }
+
+export circuit increment(val: Uint<32>): Void {}
+

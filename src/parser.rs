@@ -8,9 +8,11 @@ use std::vec;
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
 use swc_ecma_ast::{
-    ClassDecl, ClassProp, Decl, Expr, ExprStmt, Lit, ModuleDecl, ModuleItem, PropName, Stmt, TsLit, TsType, TsTypeRef, TsKeywordTypeKind
+    Accessibility, ClassDecl, ClassProp, ClassMethod, Decl, Expr, ExprStmt, Lit, ModuleDecl, ModuleItem, PropName, Stmt, TsLit, TsType, TsTypeRef, TsKeywordTypeKind
 };
 use swc_ecma_parser::{Parser, StringInput, Syntax};
+
+const DEFAULT_UINT_RANGE: usize = 32;
 
 enum ExecContext {
     ContractInit,
@@ -23,6 +25,7 @@ enum CompactType {
     Cell(Box<CompactType>),
     Bytes(usize),
     Uint(usize),
+    Void
 }
 impl CompactType {
     fn from_str(type_name: &str, arg: Option<String>) -> Result<Self, String> {
@@ -64,6 +67,7 @@ impl CompactType {
             }
             CompactType::Bytes(range) => Ok(format!("Bytes<{}>", range)),
             CompactType::Uint(size) => Ok(format!("Uint<{}>", size)),
+            CompactType::Void => Ok("Void".to_string())
         }
     }
 }
@@ -118,6 +122,10 @@ enum ContractItemKind {
     ExportLedgerValue((String, CompactType)),
     LedgerConstructor,
     LedgerPropInit(CompactVar),
+    CircuitExport(String), // name of the circuit
+    CircuitInternal(String), // name of the circuit
+    CircuitParam(String, CompactType), // name, type
+    CircuitReturnType(CompactType), // type
     Empty, // some TS code doesn't yield any Compact code
 }
 
@@ -138,13 +146,7 @@ impl ContractItem {
 
     fn print(&self) -> Result<String, String> {
         let mut output = String::from("");
-        let mut children_output = String::from("");
         let indent_str = "  ".repeat(self.indent);
-        // prints the children if any
-        for child in &self.children {
-            let output = child.print()?;
-            children_output.push_str(&output);
-        }
         match &self.kind {
             ContractItemKind::CompilerVersion(version) => {
                 let print = format!(
@@ -179,15 +181,21 @@ impl ContractItem {
                     CompactType::Uint(range) => {
                         format!("{}{}export ledger {}: Uint<{}>;", output, indent_str, name, range)
                     }
+                    CompactType::Void => {
+                        // FIXME: Void may not be a valid ledger type in Compact
+                        format!("{}{}export ledger {}: VOID;", output, indent_str, name)
+                    }
                 };
                 output.push_str(&print);
             },
             ContractItemKind::LedgerConstructor => {
+                let children = self.children.clone().into_iter().map(|child| child.print()).collect::<Result<Vec<String>, String>>()?;
+                let children_output = children.join("");
                 let print = 
                     if children_output.len() > 0 {
-                        format!("\nconstructor() {{\n{}}}", children_output)
+                        format!("\nconstructor() {{\n{}}}\n", children_output)
                     } else {
-                        format!("\nconstructor() {{}}")
+                        format!("\nconstructor() {{}}\n")
                     };
                 output.push_str(&print);
             }
@@ -222,6 +230,62 @@ impl ContractItem {
                     }
                 }
             }
+            ContractItemKind::CircuitExport(name) => {
+                // prints the parameters of the circuit
+                let params = 
+                    self.children.clone()
+                    .into_iter()
+                    .filter(|child| match child.kind {
+                        ContractItemKind::CircuitParam(_, _) => true,
+                        _ => false
+                    })
+                    .map(|child| child.print())
+                    .collect::<Result<Vec<String>, String>>()?;
+                let params_output = params.join(", ");
+                // prints the return type of the circuit
+                let return_type = 
+                    self.children.clone()
+                    .into_iter()
+                    .filter(|child| match child.kind {
+                        ContractItemKind::CircuitReturnType(_) => true,
+                        _ => false
+                    })
+                    .map(|child| child.print())
+                    .collect::<Result<Vec<String>, String>>()?;
+                let return_type_output = return_type.get(0).ok_or(format!("Circuit `{}` return type not found", name))?;
+                
+                let print = format!("{}{}export circuit {}({}): {} {{}}\n", output, indent_str, name, params_output, return_type_output);
+                output.push_str(&print);
+            }
+            ContractItemKind::CircuitInternal(name) => {
+                let print = format!("{}{}circuit {}() {{}}\n", output, indent_str, name);
+                output.push_str(&print);
+            }
+            ContractItemKind::CircuitParam(name, circuit_type) => {
+                let print = match circuit_type {
+                    CompactType::Counter => {
+                        format!("{}: Counter", name)
+                    }
+                    CompactType::Cell(subtype) => {
+                        let printed_subtype = subtype.print()?;
+                        format!("{}: Cell<{}>;\n", name, printed_subtype)
+                    }
+                    CompactType::Bytes(range) => {
+                        format!("{}: Bytes<{}>", name, range)
+                    }
+                    CompactType::Uint(range) => {
+                        format!("{}: Uint<{}>", name, range)
+                    }
+                    CompactType::Void => {
+                        // FIXME: Void may not be a valid ledger type in Compact
+                        format!("{}: VOID", name)
+                    }
+                };
+                output.push_str(&print);
+            }
+            ContractItemKind::CircuitReturnType(circuit_type) => {
+                output.push_str(&format!("{}", circuit_type.print()?));
+            }
             ContractItemKind::Empty => (),
         }
 
@@ -229,7 +293,7 @@ impl ContractItem {
     }
 }
 
-fn build_ledger_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType, String> {
+fn build_compact_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType, String> {
     // println!("--Type Ref {:#?}", param);
     let type_name = param.clone().type_name.expect_ident().sym.as_str().to_string();
     match &param.type_params {
@@ -257,7 +321,7 @@ fn build_ledger_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType, 
                         // the type must be a type that accepts a subtype
                         match type_name.as_str() {
                             "Cell" => {
-                                let subtype = build_ledger_type_from_ts_type_ref(&ts_type_ref)?;
+                                let subtype = build_compact_type_from_ts_type_ref(&ts_type_ref)?;
                                 return Ok(CompactType::Cell(Box::new(subtype)));
                             },
                             _ => return Err(format!("Type {} does not accept a subtype", type_name))
@@ -267,7 +331,7 @@ fn build_ledger_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType, 
                         match keyword.kind {
                             TsKeywordTypeKind::TsNumberKeyword => {
                                 // number in TypeScript is automatically cast to Uint<32>
-                                return CompactType::from_str("Uint", Some("32".to_string()));
+                                return CompactType::from_str("Uint", Some(DEFAULT_UINT_RANGE.to_string()));
                             },
                             _ => todo!("Handle other TsKeywordType in type params")
                         }
@@ -315,7 +379,7 @@ fn parse_ledger(
                             // println!("--Type Ref {:#?}", ts_type_ref);
                             // let type_name = ts_type_ref.clone().type_name.expect_ident().sym;
                             // Ok(type_name.as_str().to_string())
-                            build_ledger_type_from_ts_type_ref(ts_type_ref)
+                            build_compact_type_from_ts_type_ref(ts_type_ref)
                         }
                     },
                     None => Err("Ledger prop type is missing".to_string()),
@@ -459,7 +523,7 @@ fn parse_expr(
                                                                         Err("Cell constructor takes 1 argument, 0 provided".to_string())
                                                                     } else if args.len() == 1 {
                                                                         let arg = args.get(0).unwrap();                                                                
-                                                                        println!("--Arg {:#?} \n--Ledger {:#?}", arg, ledger);
+                                                                        // println!("--Arg {:#?} \n--Ledger {:#?}", arg, ledger);
                                                                         // verify that the argument is of the right type
                                                                         let expr = arg.expr.clone();
                                                                         match *expr {
@@ -597,6 +661,7 @@ fn parse_expr(
                                                 _ => todo!("Handle Uint RHS that are not NewExpr")
                                             }
                                         }
+                                        CompactType::Void => Err("Void type is not a valid ledger type".to_string())
                                     }
                                 }
                             }
@@ -612,6 +677,92 @@ fn parse_expr(
         }
         _ => todo!("Handle other expressions when parsing expression"),
     }
+}
+
+fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<Vec<ContractItem>, String> {
+    // finds the methods of the contract class
+    let methods = class_decl
+        .clone()
+        .class
+        .body
+        .into_iter()
+        .filter(|class_member| class_member.is_method())
+        .map(|class_member| class_member.method().unwrap())
+        .collect::<Vec<ClassMethod>>();
+
+    println!("--Methods {:#?}", methods);
+    let circuits = methods
+        .into_iter()
+        .map(|method| {
+            let mut circuit_children = vec![];
+            let method_name = match method.key.ident() {
+                Some(ident) => Ok(ident.sym.to_string()),
+                None => Err("Method name is missing".to_string()),
+            }?;
+            // checks if the circuit has arguments
+            let params = method.function.params;
+            if params.len() > 0 {
+                let param_items = params
+                    .into_iter()
+                    .map(|param| {
+                        let (param_name, param_type) = match param.pat {
+                            swc_ecma_ast::Pat::Ident(ident) => {
+                                let param_name = ident.sym.to_string();
+                                let param_type = match ident.type_ann {
+                                    None => Err(format!("Parameter type is missing on method `{}`", method_name)),
+                                    Some(ts_type_ann) => {
+                                        match ts_type_ann.type_ann.as_ts_keyword_type() {
+                                            None => Err(format!("Parameter type is missing on method `{}`", method_name)),
+                                            Some(keyword) => {
+                                                match keyword.kind {
+                                                    TsKeywordTypeKind::TsNumberKeyword => Ok(CompactType::Uint(DEFAULT_UINT_RANGE)),
+                                                    _ => todo!("Handle other TsKeywordType in parameter type on circuit methods"),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }?;
+                                Ok((param_name, param_type))
+                            },
+                            _ => Err(format!("Parameter name is missing on method `{}`", method_name)),
+                        }?;
+                        return Ok(ContractItem::new(ContractItemKind::CircuitParam(param_name, param_type), 0, vec![]));
+                    })
+                    .collect::<Result<Vec<ContractItem>, String>>()?;
+                circuit_children = param_items;
+            }
+            // checks that the circuit has a return type
+            let return_type = match method.function.return_type {
+                None => return Err(format!("Method `{}` must have a return type", method_name)),
+                Some(return_type) => {
+                    match return_type.type_ann.as_ts_keyword_type() {
+                        None => Err(format!("Method `{}` must have a return type", method_name)),
+                        Some(keyword) => {
+                            match keyword.kind {
+                                TsKeywordTypeKind::TsNumberKeyword => Ok(CompactType::Uint(DEFAULT_UINT_RANGE)),
+                                TsKeywordTypeKind::TsVoidKeyword => Ok(CompactType::Void),
+                                _ => todo!("Handle other TsKeywordType in parameter type on circuit methods"),
+                            }
+                        }
+                    }
+                },
+            }?;
+            circuit_children.push(ContractItem::new(ContractItemKind::CircuitReturnType(return_type), 0, vec![]));
+            // checks the body of the circuit
+
+            let circuit_item = match method.accessibility {
+                Some(accessibility) => match accessibility {
+                    Accessibility::Public => Ok(ContractItem::new(ContractItemKind::CircuitExport(method_name.clone()), 0, circuit_children)),
+                    Accessibility::Private => Ok(ContractItem::new(ContractItemKind::CircuitInternal(method_name.clone()), 0, circuit_children)),
+                    _ => Err(format!("Method {} has unknown accessibility", method_name)),
+                },
+                None => Err(format!("Method {} must be marked as `public` or `private`", method_name)),
+            }?;
+            return Ok(circuit_item);
+        })
+        .collect::<Result<Vec<ContractItem>, String>>()?;
+
+    Ok(circuits)
 }
 
 pub fn parse(file_path: &str) -> Result<String, String> {
@@ -695,13 +846,15 @@ pub fn parse(file_path: &str) -> Result<String, String> {
                 match stmt {
                     // CLASS DECLARATION
                     Stmt::Decl(Decl::Class(class_decl)) => {
+                        // LEDGER PARSING
                         if class_decl.ident.sym == "Ledger" {
                             has_ledger_class = true;
-                            let ledger_items = parse_ledger(&mut ledger, class_decl)?;
+                            let ledger_items = parse_ledger(&mut ledger, class_decl.clone())?;
                             contract_items = [contract_items.clone(), ledger_items].concat();
+                        // METHODS PARSING
                         } else if class_decl.ident.sym == "Contract" {
                             has_contract_class = true;
-                            match class_decl.class.super_class {
+                            match class_decl.clone().class.super_class {
                                 Some(super_class) => match *super_class {
                                     Expr::Ident(ident) => {
                                         if ident.sym == "CompactContract" {
@@ -720,6 +873,10 @@ pub fn parse(file_path: &str) -> Result<String, String> {
                                     ));
                                 }
                             }
+                            // TODO: check that the TS contract has a property called "ledger" of type "Ledger"
+                            // TODO: check that the TS contract has the proper constructor
+                            let circuits = parse_contract(&mut ledger, class_decl)?;
+                            contract_items = [contract_items.clone(), circuits].concat();
                         } else {
                             todo!("Handle other class declarations");
                         }
