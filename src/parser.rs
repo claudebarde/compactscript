@@ -1,9 +1,9 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
-use std::collections::HashMap;
-use std::fs::File;
+use std::{fmt::Error, fs::File};
 use std::io::Write;
 use std::path::Path;
+use std::collections::HashMap;
 use std::vec;
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
@@ -11,296 +11,18 @@ use swc_ecma_ast::{
     Accessibility, ClassDecl, ClassProp, ClassMethod, Decl, Expr, ExprStmt, Lit, ModuleDecl, ModuleItem, PropName, Stmt, TsLit, TsType, TsTypeRef, TsKeywordTypeKind
 };
 use swc_ecma_parser::{Parser, StringInput, Syntax};
+use crate::types::{CompactType, CompactLedger, CompactValue, CompactVar, ContractItem, ContractItemKind, ExecContext, ErrorMessage};
 
 const DEFAULT_UINT_RANGE: usize = 32;
 
-enum ExecContext {
-    ContractInit,
-    LedgerInit,
-}
-
-#[derive(Debug, Clone)]
-enum CompactType {
-    Counter,
-    Cell(Box<CompactType>),
-    Bytes(usize),
-    Uint(usize),
-    Void
-}
-impl CompactType {
-    fn from_str(type_name: &str, arg: Option<String>) -> Result<Self, String> {
-        match arg {
-            None => match type_name {
-                "Counter" => Ok(CompactType::Counter),
-                _ => Err(format!("Unknown ledger type with 0 argument: {}", type_name)),
-            },
-            Some(arg) => match type_name {
-                "Bytes" => {
-                    if let Ok(size) = arg.parse::<usize>() {
-                        Ok(CompactType::Bytes(size))
-                    } else {
-                        Err(format!("Invalid argument for Bytes: {}", arg))
-                    }
-                }
-                "Uint" => {
-                    if let Ok(size) = arg.parse::<usize>() {
-                        Ok(CompactType::Uint(size))
-                    } else {
-                        Err(format!("Invalid argument for Uint: {}", arg))
-                    }
-                }
-                "Cell" => match CompactType::from_str(&arg, None) {
-                    Ok(subtype) => Ok(CompactType::Cell(Box::new(subtype))),
-                    Err(e) => Err(e),
-                },
-                _ => Err(format!("Unknown ledger type with 1 argument: {}", type_name)),
-            },
-        } 
-    }
-
-    fn print(&self) -> Result<String, String> {
-        match self {
-            CompactType::Counter => Ok("Counter".to_string()),
-            CompactType::Cell(subtype) => {
-                let printed_subtype = subtype.print()?;
-                Ok(format!("Cell<{}>", printed_subtype))
-            }
-            CompactType::Bytes(range) => Ok(format!("Bytes<{}>", range)),
-            CompactType::Uint(size) => Ok(format!("Uint<{}>", size)),
-            CompactType::Void => Ok("Void".to_string())
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum CompactValue {
-    Counter(usize),                             // value
-    Cell(Box<CompactValue>),      // value type, value
-    Bytes(String),                               // range, value
-    Uint(usize),                               // range, value
-}
-
-#[derive(Debug, Clone)]
-struct CompactVar {
-    kind: CompactType,
-    name: String,
-    value: Option<CompactValue>,
-    is_ledger_value: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CompactLedger {
-    props: HashMap<String, CompactVar>, // name, value
-}
-impl CompactLedger {
-    fn add_prop(&mut self, prop_name: &str, prop_val: CompactVar) -> Result<(), String> {
-        match self.props.get(prop_name) {
-            None => {
-                self.props.insert(prop_name.to_string(), prop_val);
-                return Ok(());
-            }
-            Some(_) => return Err(format!("Ledger property already exists: {}", prop_name)),
-        }
-    }
-    
-    fn update_prop(&mut self, prop_name: &str, new_val: CompactVar) -> Result<(), String> {
-        match self.props.get(prop_name) {
-            None => return Err(format!("Ledger property not found: {}", prop_name)),
-            Some(_) => {
-                self.props.insert(prop_name.to_string(), new_val);
-                return Ok(());
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum ContractItemKind {
-    CompilerVersion(String),
-    LanguageVersion(String),
-    StdImport,
-    ExportLedgerValue((String, CompactType)),
-    LedgerConstructor,
-    LedgerPropInit(CompactVar),
-    CircuitExport(String), // name of the circuit
-    CircuitInternal(String), // name of the circuit
-    CircuitParam(String, CompactType), // name, type
-    CircuitReturnType(CompactType), // type
-    Empty, // some TS code doesn't yield any Compact code
-}
-
-#[derive(Debug, Clone)]
-struct ContractItem {
-    kind: ContractItemKind,
-    children: Vec<ContractItem>,
-    indent: usize,
-}
-impl ContractItem {
-    fn new(kind: ContractItemKind, indent: usize, children: Vec<ContractItem>) -> Self {
-        ContractItem {
-            kind,
-            children: children,
-            indent,
-        }
-    }
-
-    fn print(&self) -> Result<String, String> {
-        let mut output = String::from("");
-        let indent_str = "  ".repeat(self.indent);
-        match &self.kind {
-            ContractItemKind::CompilerVersion(version) => {
-                let print = format!(
-                    "{}{}pragma compiler_version >= {};\n",
-                    output, indent_str, version
-                );
-                output.push_str(&print);
-            }
-            ContractItemKind::LanguageVersion(version) => {
-                let print = format!(
-                    "{}{}pragma language_version >= {};\n",
-                    output, indent_str, version
-                );
-                output.push_str(&print);
-            }
-            ContractItemKind::StdImport => {
-                let print = format!("{}{}import CompactStandardLibrary;\n", output, indent_str);
-                output.push_str(&print);
-            }
-            ContractItemKind::ExportLedgerValue((name, ledger_type)) => {
-                let print = match ledger_type {
-                    CompactType::Counter => {
-                        format!("{}{}export ledger {}: Counter;", output, indent_str, name)
-                    }
-                    CompactType::Cell(subtype) => {
-                        let printed_subtype = subtype.print()?;
-                        format!("{}{}export ledger {}: Cell<{}>;", output, indent_str, name, printed_subtype)
-                    }
-                    CompactType::Bytes(range) => {
-                        format!("{}{}export ledger {}: Bytes<{}>;", output, indent_str, name, range)
-                    }
-                    CompactType::Uint(range) => {
-                        format!("{}{}export ledger {}: Uint<{}>;", output, indent_str, name, range)
-                    }
-                    CompactType::Void => {
-                        // FIXME: Void may not be a valid ledger type in Compact
-                        format!("{}{}export ledger {}: VOID;", output, indent_str, name)
-                    }
-                };
-                output.push_str(&print);
-            },
-            ContractItemKind::LedgerConstructor => {
-                let children = self.children.clone().into_iter().map(|child| child.print()).collect::<Result<Vec<String>, String>>()?;
-                let children_output = children.join("");
-                let print = 
-                    if children_output.len() > 0 {
-                        format!("\nconstructor() {{\n{}}}\n", children_output)
-                    } else {
-                        format!("\nconstructor() {{}}\n")
-                    };
-                output.push_str(&print);
-            }
-            ContractItemKind::LedgerPropInit(ledger_var) => {
-                match &ledger_var.value {
-                    None => {
-                        println!("--Ledger Var {:#?}", ledger_var);
-                        panic!("Non initialized property value in ledger")
-                    },
-                    Some(ledger_value) => {
-                        let print = match ledger_value {
-                            CompactValue::Counter(_) => "".to_string(),
-                            CompactValue::Cell(cell_val) => {
-                                match *cell_val.clone() {
-                                    CompactValue::Bytes(val) => {
-                                        format!("{}{}{} = \"{}\" // {}.write(\"{}\")\n", output, indent_str, ledger_var.name, val, ledger_var.name, val)
-                                    }
-                                    CompactValue::Uint(val) => {
-                                        format!("{}{}{} = {} // {}.write({})\n", output, indent_str, ledger_var.name, val, ledger_var.name, val)
-                                    }
-                                    _ => panic!("Unknown ledger value type to print: {:#?}", *cell_val),
-                                }
-                            }
-                            CompactValue::Bytes(val) => {
-                                format!("{}{}{} = {}\n", output, indent_str, ledger_var.name, val)
-                            },
-                            CompactValue::Uint(val) => {
-                                format!("{}{}{} = {}\n", output, indent_str, ledger_var.name, val)
-                            },
-                        };
-                        output.push_str(&print);                        
-                    }
-                }
-            }
-            ContractItemKind::CircuitExport(name) => {
-                // prints the parameters of the circuit
-                let params = 
-                    self.children.clone()
-                    .into_iter()
-                    .filter(|child| match child.kind {
-                        ContractItemKind::CircuitParam(_, _) => true,
-                        _ => false
-                    })
-                    .map(|child| child.print())
-                    .collect::<Result<Vec<String>, String>>()?;
-                let params_output = params.join(", ");
-                // prints the return type of the circuit
-                let return_type = 
-                    self.children.clone()
-                    .into_iter()
-                    .filter(|child| match child.kind {
-                        ContractItemKind::CircuitReturnType(_) => true,
-                        _ => false
-                    })
-                    .map(|child| child.print())
-                    .collect::<Result<Vec<String>, String>>()?;
-                let return_type_output = return_type.get(0).ok_or(format!("Circuit `{}` return type not found", name))?;
-                
-                let print = format!("{}{}export circuit {}({}): {} {{}}\n", output, indent_str, name, params_output, return_type_output);
-                output.push_str(&print);
-            }
-            ContractItemKind::CircuitInternal(name) => {
-                let print = format!("{}{}circuit {}() {{}}\n", output, indent_str, name);
-                output.push_str(&print);
-            }
-            ContractItemKind::CircuitParam(name, circuit_type) => {
-                let print = match circuit_type {
-                    CompactType::Counter => {
-                        format!("{}: Counter", name)
-                    }
-                    CompactType::Cell(subtype) => {
-                        let printed_subtype = subtype.print()?;
-                        format!("{}: Cell<{}>;\n", name, printed_subtype)
-                    }
-                    CompactType::Bytes(range) => {
-                        format!("{}: Bytes<{}>", name, range)
-                    }
-                    CompactType::Uint(range) => {
-                        format!("{}: Uint<{}>", name, range)
-                    }
-                    CompactType::Void => {
-                        // FIXME: Void may not be a valid ledger type in Compact
-                        format!("{}: VOID", name)
-                    }
-                };
-                output.push_str(&print);
-            }
-            ContractItemKind::CircuitReturnType(circuit_type) => {
-                output.push_str(&format!("{}", circuit_type.print()?));
-            }
-            ContractItemKind::Empty => (),
-        }
-
-        return Ok(output.to_string());
-    }
-}
-
-fn build_compact_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType, String> {
+fn build_compact_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType, ErrorMessage> {
     // println!("--Type Ref {:#?}", param);
     let type_name = param.clone().type_name.expect_ident().sym.as_str().to_string();
     match &param.type_params {
         None => CompactType::from_str(type_name.as_str(), None),
         Some(type_params) => {
             if type_params.params.len() == 0 {                
-                return CompactType::from_str(&type_name, None)
+                CompactType::from_str(&type_name, None)
             } else if type_params.params.len() == 1 {
                 let ts_type = type_params.params.get(0).unwrap();
                 match *ts_type.clone() {
@@ -308,11 +30,11 @@ fn build_compact_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType,
                         match ts_lit_type.lit {
                             TsLit::Str(str_lit) => {
                                 let arg = str_lit.value.as_str().to_string();
-                                return CompactType::from_str(&type_name, Some(arg));
+                                CompactType::from_str(&type_name, Some(arg))
                             },
                             TsLit::Number(num_lit) => {
                                 let arg = num_lit.value.to_string();
-                                return CompactType::from_str(&type_name, Some(arg));
+                                CompactType::from_str(&type_name, Some(arg))
                             },
                             _ => todo!("Handle other TsLitType in type params")
                         }
@@ -322,9 +44,9 @@ fn build_compact_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType,
                         match type_name.as_str() {
                             "Cell" => {
                                 let subtype = build_compact_type_from_ts_type_ref(&ts_type_ref)?;
-                                return Ok(CompactType::Cell(Box::new(subtype)));
+                                Ok(CompactType::Cell(Box::new(subtype)))
                             },
-                            _ => return Err(format!("Type {} does not accept a subtype", type_name))
+                            _ => Err(ErrorMessage::NotAComplexType(type_name))
                         }
                     }
                     TsType::TsKeywordType(keyword) => {
@@ -351,7 +73,7 @@ fn build_compact_type_from_ts_type_ref(param: &TsTypeRef) -> Result<CompactType,
 fn parse_ledger(
     ledger: &mut CompactLedger,
     class_decl: ClassDecl,
-) -> Result<Vec<ContractItem>, String> {
+) -> Result<Vec<ContractItem>, ErrorMessage> {
     // get the properties of the ledger class
     let class_props = class_decl
         .clone()
@@ -369,12 +91,12 @@ fn parse_ledger(
                 // finds the name of the ledger property
                 let prop_name = match class_prop.key {
                     PropName::Ident(ident) => Ok(ident.to_string()),
-                    _ => Err("Ledger prop name is missing".to_string()),
+                    _ => Err(ErrorMessage::MissingPropName),
                 }?;
                 // finds the type of the ledger property
                 let ledger_type = match class_prop.type_ann {
                     Some(type_ann) => match type_ann.type_ann.as_ts_type_ref() {
-                        None => Err("Ledger prop type annotation is missing".to_string()),
+                        None => Err(ErrorMessage::MissingPropTypeAnnotation),
                         Some(ts_type_ref) => {
                             // println!("--Type Ref {:#?}", ts_type_ref);
                             // let type_name = ts_type_ref.clone().type_name.expect_ident().sym;
@@ -382,14 +104,14 @@ fn parse_ledger(
                             build_compact_type_from_ts_type_ref(ts_type_ref)
                         }
                     },
-                    None => Err("Ledger prop type is missing".to_string()),
+                    None => Err(ErrorMessage::MissingPropTypeAnnotation),
                 }?;
                 // checks if the type is a valid ledger type
                 // let ledger_type = CompactType::from_str(&prop_type)?;
 
                 return Ok((prop_name, ledger_type));
             })
-            .collect::<Result<Vec<(String, CompactType)>, String>>()?;
+            .collect::<Result<Vec<(String, CompactType)>, ErrorMessage>>()?;
         // println!("--Prop Items: {:#?}", props); 
         let mut ledger_items = props
             .into_iter()
@@ -412,7 +134,7 @@ fn parse_ledger(
                     Err(e) => Err(e),
                 }
             })
-            .collect::<Result<Vec<ContractItem>, String>>()?;
+            .collect::<Result<Vec<ContractItem>, ErrorMessage>>()?;
         // get the constructor of the ledger class
         let constructor = class_decl
             .clone()
@@ -430,9 +152,9 @@ fn parse_ledger(
                         .into_iter()
                         .map(|stmt| match stmt {
                             Stmt::Expr(expr) => parse_expr(expr, ExecContext::LedgerInit, ledger),
-                            _ => Err("Constructor body statement not implemented".to_string()),
+                            _ => Err(ErrorMessage::NoConstructorBody),
                         })
-                        .collect::<Result<Vec<ContractItem>, String>>()?;
+                        .collect::<Result<Vec<ContractItem>, ErrorMessage>>()?;
                     // ledger_items = [ledger_items.clone(), constructor_items].concat();
                     let constructor_item = ContractItem::new(ContractItemKind::LedgerConstructor, 0, constructor_items);
                     ledger_items.push(constructor_item);
@@ -451,7 +173,7 @@ fn parse_expr(
     expr: ExprStmt,
     exec_context: ExecContext,
     ledger: &mut CompactLedger,
-) -> Result<ContractItem, String> {
+) -> Result<ContractItem, ErrorMessage> {
     // println!("--Expr {:#?}", expr);
     match *expr.expr {
         Expr::Assign(assign_expr) => {
@@ -464,10 +186,10 @@ fn parse_expr(
                             // initializing ledger property
                             let member_ident = member_expr.prop.expect_ident();
                             let prop_name = member_ident.sym.as_str();
-                            let prop = ledger.props.get(prop_name).ok_or(format!("Ledger property not found: {}", prop_name))?;
+                            let prop = ledger.props.get(prop_name).ok_or(ErrorMessage::LedgerPropertyNotFound(prop_name.to_string()))?;
                             // println!("--Find Prop {:#?}", prop);
                             match &prop.value {
-                                Some(_) => Err(format!("Property value in ledger is already initialized: {:#?}", prop)),
+                                Some(_) => Err(ErrorMessage::LedgerPropertyExists(prop_name.to_string())),
                                 None => {
                                     match &prop.kind {
                                         CompactType::Counter => {
@@ -494,13 +216,13 @@ fn parse_expr(
                                                                     } else if args.len() == 1 {
                                                                         todo!("Handle Counter constructor with 1 argument")
                                                                     } else {
-                                                                        Err("Counter constructor takes 0 or 1 argument".to_string())
+                                                                        Err(ErrorMessage::CounterTooManyArgs(args.len()))
                                                                     }
                                                                 }
                                                             }
                                                             
                                                         } else {
-                                                            Err(format!("Property {} is of an unknown type `{}`", prop_name, new_expr_ident.sym))
+                                                            Err(ErrorMessage::UnknownTypeProperty(new_expr_ident.sym.to_string(), prop_name.to_string()))
                                                         }
                                                     } else {
                                                         todo!("Handle other new expressions when assigning value in expression parsing")
@@ -517,10 +239,10 @@ fn parse_expr(
                                                         let new_expr_ident = new_expr_callee.expect_ident();
                                                         if new_expr_ident.sym == "Cell" {
                                                             match new_expr.args {
-                                                                None => Err("Cell constructor takes 1 argument".to_string()),
+                                                                None => Err(ErrorMessage::CellConstructorArgs(0)),
                                                                 Some(args) => {
                                                                     if args.len() == 0 {
-                                                                        Err("Cell constructor takes 1 argument, 0 provided".to_string())
+                                                                        Err(ErrorMessage::CellConstructorArgs(0))
                                                                     } else if args.len() == 1 {
                                                                         let arg = args.get(0).unwrap();                                                                
                                                                         // println!("--Arg {:#?} \n--Ledger {:#?}", arg, ledger);
@@ -531,13 +253,14 @@ fn parse_expr(
                                                                                 let initial_value = match lit {
                                                                                     Lit::Num(num_lit) => Ok(num_lit.value.to_string()),
                                                                                     Lit::Str(str_lit) => Ok(str_lit.value.as_str().to_string()),
-                                                                                    _ => Err("Cell constructor argument must be a number".to_string())
+                                                                                    // FIXME: handle other types in error message
+                                                                                    _ => Err(ErrorMessage::CellConstructorArgType("number".to_string(), "other".to_string()))
                                                                                 }?;
                                                                                 if initial_value.len() != 0 {
                                                                                     // Cell is not initialized
                                                                                     let cell_value = match **subtype {
                                                                                         CompactType::Bytes(_) => CompactValue::Bytes(initial_value),
-                                                                                        CompactType::Uint(_) => CompactValue::Uint(initial_value.parse::<usize>().map_err(|e| e.to_string())?),
+                                                                                        CompactType::Uint(_) => CompactValue::Uint(initial_value.parse::<usize>().map_err(|e| ErrorMessage::Custom(e.to_string()))?),
                                                                                         _ => todo!("Handle other cell types"),
                                                                                     };
                                                                                     let compact_var = CompactVar {
@@ -556,15 +279,16 @@ fn parse_expr(
                                                                                     todo!("Handle other initial values for Cell")
                                                                                 }
                                                                             },
-                                                                            _ => Err("Cell constructor argument must be a number".to_string())
+                                                                            // FIXME: handle other types in error message
+                                                                            _ => Err(ErrorMessage::CellConstructorArgType("number".to_string(), "other".to_string()))
                                                                             }
                                                                     } else {
-                                                                        Err(format!("Cell constructor takes 1 argument, {} provided", args.len()))
+                                                                        Err(ErrorMessage::CellConstructorArgs(args.len()))
                                                                     }
                                                                 }
                                                             }                                                    
                                                         } else {
-                                                            Err(format!("Property {} is of an unknown type `{}`", prop_name, new_expr_ident.sym))
+                                                            Err(ErrorMessage::UnknownTypeProperty(new_expr_ident.sym.to_string(), prop_name.to_string()))
                                                         }
                                                     } else {
                                                         todo!("Handle other new expressions when assigning value in expression parsing")
@@ -573,15 +297,17 @@ fn parse_expr(
                                                 _ => todo!("Handle other right expressions when assigning value in expression parsing for Cell"),
                                             }
                                         }
-                                        CompactType::Bytes(_ ) => {
+                                        CompactType::Bytes(_) => {
                                             // println!("--Bytes: range: {} / value: {:#?} / right: {:#?}", range, value, right);
                                             match *right {
                                                 Expr::New(expr) => {
                                                     match expr.args {
-                                                        None => Err("No argument provided of type Bytes".to_string()),
+                                                        // FIXME: handle other types in error message
+                                                        None => Err(ErrorMessage::UnexpectedArgType("bytes".to_string(), "other".to_string())),
                                                         Some(expr_args) => {
                                                             if expr_args.len() == 0 {
-                                                                Err("No argument provided of type Bytes".to_string())
+                                                                // FIXME: handle other types in error message
+                                                                Err(ErrorMessage::UnexpectedArgType("bytes".to_string(), "other".to_string()))
                                                             } else if expr_args.len() == 1 {
                                                                 let expr_arg = *expr_args.get(0).unwrap().expr.clone();
                                                                 match expr_arg {
@@ -604,13 +330,15 @@ fn parse_expr(
                                                                                     vec![],
                                                                                 ))
                                                                             },
-                                                                            _ => Err("Bytes argument must be a string".to_string())
+                                                                            // FIXME: handle other types in error message
+                                                                            _ => Err(ErrorMessage::InvalidBytesArgument("other".to_string()))
                                                                         }
                                                                     },
-                                                                    _ => Err("Bytes argument must be a string".to_string())
+                                                                    // FIXME: handle other types in error message
+                                                                    _ => Err(ErrorMessage::InvalidBytesArgument("string".to_string()))
                                                                 }
                                                             } else {
-                                                                Err(format!("Expected 1 argument of type Bytes, got {}", expr_args.len()))
+                                                                Err(ErrorMessage::UnexpectedArgNumber(1, expr_args.len()))
                                                             }
                                                         }
                                                     }
@@ -623,10 +351,10 @@ fn parse_expr(
                                             match *right {
                                                 Expr::New(expr) => {
                                                     match expr.args {
-                                                        None => Err("No argument provided of type Uint".to_string()),
+                                                        None => Err(ErrorMessage::UnexpectedArgNumber(1, 0)),
                                                         Some(expr_args) => {
                                                             if expr_args.len() == 0 {
-                                                                Err("No argument provided of type Uint".to_string())
+                                                                Err(ErrorMessage::UnexpectedArgNumber(1, 0))
                                                             } else if expr_args.len() == 1 {
                                                                 let expr_arg = *expr_args.get(0).unwrap().expr.clone();
                                                                 match expr_arg {
@@ -647,13 +375,16 @@ fn parse_expr(
                                                                                     1, vec![],
                                                                                 ))
                                                                             },
-                                                                            _ => Err("Uint argument must be a number".to_string())
+                                                                            // FIXME: handle other types in error message
+                                                                            _ => Err(ErrorMessage::InvalidUintArgument("other".to_string()))
                                                                         }
                                                                     },
-                                                                    _ => Err("Uint argument must be a number".to_string())
+                                                                    // FIXME: handle other types in error message
+                                                                    _ => Err(ErrorMessage::InvalidUintArgument("other".to_string()))
                                                                 }
                                                             } else {
-                                                                Err(format!("Expected 1 argument of type Uint, got {}", expr_args.len()))
+                                                                // FIXME: it could be nice to pinpoint the type that triggered the error
+                                                                Err(ErrorMessage::UnexpectedArgNumber(1, expr_args.len()))
                                                             }
                                                         }
                                                     }
@@ -661,7 +392,7 @@ fn parse_expr(
                                                 _ => todo!("Handle Uint RHS that are not NewExpr")
                                             }
                                         }
-                                        CompactType::Void => Err("Void type is not a valid ledger type".to_string())
+                                        CompactType::Void => Err(ErrorMessage::InvalidLedgerType("Void".to_string())),
                                     }
                                 }
                             }
@@ -679,7 +410,7 @@ fn parse_expr(
     }
 }
 
-fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<Vec<ContractItem>, String> {
+fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<Vec<ContractItem>, ErrorMessage> {
     // finds the methods of the contract class
     let methods = class_decl
         .clone()
@@ -697,7 +428,7 @@ fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<V
             let mut circuit_children = vec![];
             let method_name = match method.key.ident() {
                 Some(ident) => Ok(ident.sym.to_string()),
-                None => Err("Method name is missing".to_string()),
+                None => Err(ErrorMessage::MissingMethodName),
             }?;
             // checks if the circuit has arguments
             let params = method.function.params;
@@ -709,10 +440,10 @@ fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<V
                             swc_ecma_ast::Pat::Ident(ident) => {
                                 let param_name = ident.sym.to_string();
                                 let param_type = match ident.type_ann {
-                                    None => Err(format!("Parameter type is missing on method `{}`", method_name)),
+                                    None => Err(ErrorMessage::MissingParamTypeOnMethod(method_name.to_string())),
                                     Some(ts_type_ann) => {
                                         match ts_type_ann.type_ann.as_ts_keyword_type() {
-                                            None => Err(format!("Parameter type is missing on method `{}`", method_name)),
+                                            None => Err(ErrorMessage::MissingParamNameOnMethod(method_name.to_string())),
                                             Some(keyword) => {
                                                 match keyword.kind {
                                                     TsKeywordTypeKind::TsNumberKeyword => Ok(CompactType::Uint(DEFAULT_UINT_RANGE)),
@@ -724,19 +455,19 @@ fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<V
                                 }?;
                                 Ok((param_name, param_type))
                             },
-                            _ => Err(format!("Parameter name is missing on method `{}`", method_name)),
+                            _ => Err(ErrorMessage::MissingParamNameOnMethod(method_name.to_string())),
                         }?;
                         return Ok(ContractItem::new(ContractItemKind::CircuitParam(param_name, param_type), 0, vec![]));
                     })
-                    .collect::<Result<Vec<ContractItem>, String>>()?;
+                    .collect::<Result<Vec<ContractItem>, ErrorMessage>>()?;
                 circuit_children = param_items;
             }
             // checks that the circuit has a return type
             let return_type = match method.function.return_type {
-                None => return Err(format!("Method `{}` must have a return type", method_name)),
+                None => return Err(ErrorMessage::ReturnTypeOnMethod(method_name)),
                 Some(return_type) => {
                     match return_type.type_ann.as_ts_keyword_type() {
-                        None => Err(format!("Method `{}` must have a return type", method_name)),
+                        None => Err(ErrorMessage::ReturnTypeOnMethod(method_name.to_string())),
                         Some(keyword) => {
                             match keyword.kind {
                                 TsKeywordTypeKind::TsNumberKeyword => Ok(CompactType::Uint(DEFAULT_UINT_RANGE)),
@@ -752,20 +483,20 @@ fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<V
 
             let circuit_item = match method.accessibility {
                 Some(accessibility) => match accessibility {
-                    Accessibility::Public => Ok(ContractItem::new(ContractItemKind::CircuitExport(method_name.clone()), 0, circuit_children)),
+                    Accessibility::Public => Ok(ContractItem::new(ContractItemKind::CircuitExport(method_name.to_string()), 0, circuit_children)),
                     Accessibility::Private => Ok(ContractItem::new(ContractItemKind::CircuitInternal(method_name.clone()), 0, circuit_children)),
-                    _ => Err(format!("Method {} has unknown accessibility", method_name)),
+                    _ => Err(ErrorMessage::Custom(format!("Method {} has unknown accessibility", method_name))),
                 },
-                None => Err(format!("Method {} must be marked as `public` or `private`", method_name)),
+                None => Err(ErrorMessage::InaccessibleMethod(method_name)),
             }?;
             return Ok(circuit_item);
         })
-        .collect::<Result<Vec<ContractItem>, String>>()?;
+        .collect::<Result<Vec<ContractItem>, ErrorMessage>>()?;
 
     Ok(circuits)
 }
 
-pub fn parse(file_path: &str) -> Result<String, String> {
+pub fn parse(file_path: &str) -> Result<String, ErrorMessage> {
     let mut contract_items: Vec<ContractItem> = vec![];
     let mut has_ledger_class = false;
     let mut has_contract_class = false;
@@ -823,16 +554,16 @@ pub fn parse(file_path: &str) -> Result<String, String> {
                             }
                         }
                     } else {
-                        return Err(format!(
+                        return Err(ErrorMessage::Custom(format!(
                             "Comment line length for compiler/language-version is 0"
-                        ));
+                        )));
                     }
                 }
                 Err(e) => {
-                    return Err(format!(
+                    return Err(ErrorMessage::Custom(format!(
                         "Unable to find line of compiler/language-version: {:?}",
                         e
-                    ));
+                    )));
                 }
             }
         }
@@ -862,15 +593,15 @@ pub fn parse(file_path: &str) -> Result<String, String> {
                                         }
                                     }
                                     _ => {
-                                        return Err(format!(
+                                        return Err(ErrorMessage::Custom(format!(
                                             "Contract class does not extend CompactContract"
-                                        ));
+                                        )));
                                     }
                                 },
                                 None => {
-                                    return Err(format!(
+                                    return Err(ErrorMessage::Custom(format!(
                                         "Contract class does not extend CompactContract"
-                                    ));
+                                    )));
                                 }
                             }
                             // TODO: check that the TS contract has a property called "ledger" of type "Ledger"
@@ -898,10 +629,10 @@ pub fn parse(file_path: &str) -> Result<String, String> {
                         }
                         Ok(())
                     } else {
-                        return Err(format!(
+                        return Err(ErrorMessage::Custom(format!(
                             "There is no import specifier ({:?})",
                             import_decl.span
-                        ));
+                        )));
                     }
                 }
                 _ => {
@@ -914,22 +645,22 @@ pub fn parse(file_path: &str) -> Result<String, String> {
     })?;
 
     if has_ledger_class == false {
-        return Err(format!("Ledger class not found"));
+        return Err(ErrorMessage::LedgerClassNotFound);
     } else if has_contract_class == false {
-        return Err(format!("Contract class not found"));
+        return Err(ErrorMessage::ContractClassNotFound);
     } 
 
-    let root_path = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root_path = std::env::current_dir().map_err(|e| ErrorMessage::Custom(e.to_string()))?;
     let output_path = format!("{}/compact/counter/contract.compact", root_path.display());
-    let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
+    let mut output_file = File::create(&output_path).map_err(|e| ErrorMessage::Custom(e.to_string()))?;
 
     // println!("-- Contract Items: {:#?}", contract_items);
     for item in &contract_items {
         let printed_output = item.print()?;
-        writeln!(output_file, "{}", printed_output).map_err(|e| e.to_string())?;
+        writeln!(output_file, "{}", printed_output).map_err(|e| ErrorMessage::Custom(e.to_string()))?;
     }
 
-    let file_output = std::fs::read_to_string(&output_path).map_err(|e| e.to_string())?;
+    let file_output = std::fs::read_to_string(&output_path).map_err(|e| ErrorMessage::Custom(e.to_string()))?;
 
     Ok(file_output)
 }
