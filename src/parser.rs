@@ -4,7 +4,7 @@ use std::{f64::consts::E, fs::File};
 use std::io::Write;
 use std::path::Path;
 use std::collections::HashMap;
-use std::vec;
+use std::{mem, vec};
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
 use swc_ecma_ast::{
@@ -426,19 +426,44 @@ fn parse_expr(
             }
         }
         Expr::Member(member_expr) => {
-            let res = parse_expr(*member_expr.obj, exec_context, ledger)?;
-            println!("--Obj Expr {:#?}", res);
+            let res = parse_expr(*member_expr.obj.clone(), exec_context, ledger)?;
             match res.kind {
                 ContractItemKind::This => {
                     // the following property must be "ledger"
                     // TODO: allow other properties after "this" in a method call
-                    todo!("Handle member expressions after 'this' when parsing expression")
+                    match member_expr.prop.ident() {
+                        Some(ident) => {
+                            let prop_name = ident.sym.to_string();
+                            if prop_name == "ledger" {
+                                Ok(ContractItem::new(ContractItemKind::Ledger, 0, vec![]))
+                            } else {
+                                Err(ErrorMessage::InvalidThisProperty(prop_name.to_string()))
+                            }
+                        }
+                        None => Err(ErrorMessage::InvalidThisProperty("".to_string())),
+                    }
                 }
+                ContractItemKind::Ledger => {
+                    match member_expr.prop.ident() {
+                        Some(ident) => {
+                            let prop_name = ident.sym.to_string();
+                            match ledger.props.get(&prop_name) {
+                                Some(_) => Ok(ContractItem::new(ContractItemKind::LedgerProp(prop_name), 1, vec![])),
+                                None => Err(ErrorMessage::LedgerPropertyNotFound(prop_name.to_string())),
+                            }
+                        }
+                        None => Err(ErrorMessage::MissingLedgerProperty),
+                    }
+                },
+                ContractItemKind::LedgerProp(prop_name) => {
+                    println!("--Member Expr {:#?}", member_expr);
+                    todo!("Handle ledger prop member expressions when parsing expression")
+                },
                 _ => todo!("Handle member expressions when parsing expression")
             }
         }
         Expr::This(_) => match exec_context {
-            ExecContext::Circuit => Ok(ContractItem::new(ContractItemKind::This, 1, vec![])),
+            ExecContext::Circuit => Ok(ContractItem::new(ContractItemKind::This, 0, vec![])),
             _ => Err(ErrorMessage::InvalidThisContext),
         },
         _ => todo!("Handle other expressions when parsing expression"),

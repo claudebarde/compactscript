@@ -158,8 +158,10 @@ pub enum ContractItemKind {
     CircuitInternal(String),           // name of the circuit
     CircuitParam(String, CompactType), // name, type
     CircuitReturnType(CompactType),    // type
-    This,                              // not meant to be printed, used for verification
-    Empty,                             // some TS code doesn't yield any Compact code
+    Ledger,                            // not meant to be printed, used for verification
+    LedgerProp(String),
+    This,  // not meant to be printed, used for verification
+    Empty, // some TS code doesn't yield any Compact code
 }
 
 #[derive(Debug, Clone)]
@@ -347,7 +349,11 @@ impl ContractItem {
             ContractItemKind::CircuitReturnType(circuit_type) => {
                 output.push_str(&format!("{}", circuit_type.print()));
             }
-            ContractItemKind::Empty | ContractItemKind::This => (),
+            ContractItemKind::LedgerProp(name) => {
+                let print = format!("{}{}{}", output, indent_str, name);
+                output.push_str(&print);
+            }
+            ContractItemKind::Empty | ContractItemKind::This | ContractItemKind::Ledger => (),
         }
 
         return Ok(output.to_string());
@@ -383,6 +389,7 @@ pub enum ErrorMessage {
     MissingMethodBody(String),
     InvalidMethodBody(String),
     InvalidThisContext,
+    InvalidThisProperty(String),
     MissingLedgerProperty,
     TooManyContractProperties,
     MissingLedgerPropertyAnnotation,
@@ -480,6 +487,16 @@ impl ErrorMessage {
             }
             ErrorMessage::MissingLedgerPropertyAnnotation => {
                 format!("Ledger property must implement the user-defined `Ledger` class")
+            }
+            ErrorMessage::InvalidThisProperty(name) => {
+                if name.len() == 0 {
+                    format!("No property set on `this` in the Contract instance")
+                } else {
+                    format!(
+                        "Property {} is not available on the Contract instance",
+                        name
+                    )
+                }
             }
             ErrorMessage::Custom(msg) => {
                 format!("{}", msg)
