@@ -15,3 +15,5 @@ constructor() {
 
 export circuit increment(val: Uint<32>): Void {}
 
+export circuit decrement(val: Uint<32>): Void {}
+

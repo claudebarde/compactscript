@@ -3,6 +3,7 @@ use std::{collections::HashMap, f32::consts::E, fmt::Error};
 pub enum ExecContext {
     ContractInit,
     LedgerInit,
+    Circuit,
 }
 
 #[derive(Debug, Clone)]
@@ -11,6 +12,7 @@ pub enum CompactType {
     Cell(Box<CompactType>),
     Bytes(usize),
     Uint(usize),
+    Boolean,
     Void,
 }
 impl CompactType {
@@ -54,6 +56,46 @@ impl CompactType {
             CompactType::Bytes(range) => format!("Bytes<{}>", range),
             CompactType::Uint(size) => format!("Uint<{}>", size),
             CompactType::Void => "Void".to_string(),
+            CompactType::Boolean => "Boolean".to_string(),
+        }
+    }
+
+    pub fn is_method_valid(&self, method_name: &str) -> bool {
+        match self {
+            CompactType::Counter => {
+                let valid_methods = HashMap::from([
+                    (
+                        "increment",
+                        (Some(CompactType::Uint(usize::MAX)), CompactType::Void),
+                    ),
+                    (
+                        "decrement",
+                        (Some(CompactType::Uint(usize::MAX)), CompactType::Void),
+                    ),
+                    ("less_than", (None, CompactType::Boolean)),
+                    ("read", (None, CompactType::Uint(usize::MAX))),
+                    ("reset_to_default", (None, CompactType::Void)),
+                ]);
+                if valid_methods.contains_key(method_name) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            CompactType::Cell(_) => match method_name {
+                "write" => true,
+                _ => false,
+            },
+            CompactType::Bytes(_) => match method_name {
+                "write" => true,
+                _ => false,
+            },
+            CompactType::Uint(_) => match method_name {
+                "write" => true,
+                _ => false,
+            },
+            CompactType::Void => false,
+            CompactType::Boolean => false,
         }
     }
 }
@@ -116,6 +158,7 @@ pub enum ContractItemKind {
     CircuitInternal(String),           // name of the circuit
     CircuitParam(String, CompactType), // name, type
     CircuitReturnType(CompactType),    // type
+    This,                              // not meant to be printed, used for verification
     Empty,                             // some TS code doesn't yield any Compact code
 }
 
@@ -182,7 +225,10 @@ impl ContractItem {
                     }
                     CompactType::Void => {
                         // FIXME: Void may not be a valid ledger type in Compact
-                        format!("{}{}export ledger {}: VOID;", output, indent_str, name)
+                        format!("{}{}export ledger {}: Void;", output, indent_str, name)
+                    }
+                    CompactType::Boolean => {
+                        format!("{}{}export ledger {}: Boolean;", output, indent_str, name)
                     }
                 };
                 output.push_str(&print);
@@ -290,7 +336,10 @@ impl ContractItem {
                     }
                     CompactType::Void => {
                         // FIXME: Void may not be a valid ledger type in Compact
-                        format!("{}: VOID", name)
+                        format!("{}: Void", name)
+                    }
+                    CompactType::Boolean => {
+                        format!("{}: Boolean", name)
                     }
                 };
                 output.push_str(&print);
@@ -298,13 +347,14 @@ impl ContractItem {
             ContractItemKind::CircuitReturnType(circuit_type) => {
                 output.push_str(&format!("{}", circuit_type.print()));
             }
-            ContractItemKind::Empty => (),
+            ContractItemKind::Empty | ContractItemKind::This => (),
         }
 
         return Ok(output.to_string());
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum ErrorMessage {
     NotAComplexType(String),
     UnknownLedgerType(String),
@@ -330,6 +380,12 @@ pub enum ErrorMessage {
     MissingParamTypeOnMethod(String),
     MissingPropTypeAnnotation,
     MissingPropName,
+    MissingMethodBody(String),
+    InvalidMethodBody(String),
+    InvalidThisContext,
+    MissingLedgerProperty,
+    TooManyContractProperties,
+    MissingLedgerPropertyAnnotation,
     Custom(String),
 }
 impl ErrorMessage {
@@ -406,6 +462,24 @@ impl ErrorMessage {
             }
             ErrorMessage::MissingPropName => {
                 format!("Property must have a name")
+            }
+            ErrorMessage::MissingMethodBody(name) => {
+                format!("Method {} must have a body", name)
+            }
+            ErrorMessage::InvalidMethodBody(name) => {
+                format!("Method {} has an invalid body", name)
+            }
+            ErrorMessage::InvalidThisContext => {
+                format!("`this` can only be used in a method body")
+            }
+            ErrorMessage::MissingLedgerProperty => {
+                format!("Ledger property not found on Contract class")
+            }
+            ErrorMessage::TooManyContractProperties => {
+                format!("Too many properties on Contract class, expected only one")
+            }
+            ErrorMessage::MissingLedgerPropertyAnnotation => {
+                format!("Ledger property must implement the user-defined `Ledger` class")
             }
             ErrorMessage::Custom(msg) => {
                 format!("{}", msg)

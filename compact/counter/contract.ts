@@ -27,4 +27,8 @@ class Contract extends CompactContract<Ledger> {
   public increment(val: number): void {
     this.ledger.round.increment(val);
   }
+
+  public decrement(val: number): void {
+    this.ledger.round.decrement(val);
+  }
 }

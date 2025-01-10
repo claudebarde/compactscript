@@ -11,6 +11,10 @@ export class Counter {
   increment(val: number) {
     this.value = BigInt(Number(this.value) + val);
   }
+
+  decrement(val: number) {
+    this.value = BigInt(Number(this.value) - val);
+  }
 }
 
 export class Cell<T> {

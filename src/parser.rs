@@ -1,6 +1,6 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
-use std::{fmt::Error, fs::File};
+use std::{f64::consts::E, fs::File};
 use std::io::Write;
 use std::path::Path;
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use std::vec;
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
 use swc_ecma_ast::{
-    Accessibility, ClassDecl, ClassProp, ClassMethod, Decl, Expr, ExprStmt, Lit, ModuleDecl, ModuleItem, PropName, Stmt, TsLit, TsType, TsTypeRef, TsKeywordTypeKind
+    Accessibility, Callee, ClassDecl, ClassMethod, ClassProp, Decl, Expr, Lit, MemberExpr, ModuleDecl, ModuleItem, PropName, Stmt, TsKeywordTypeKind, TsLit, TsType, TsTypeRef
 };
 use swc_ecma_parser::{Parser, StringInput, Syntax};
 use crate::types::{CompactType, CompactLedger, CompactValue, CompactVar, ContractItem, ContractItemKind, ExecContext, ErrorMessage};
@@ -151,7 +151,7 @@ fn parse_ledger(
                         .stmts
                         .into_iter()
                         .map(|stmt| match stmt {
-                            Stmt::Expr(expr) => parse_expr(expr, ExecContext::LedgerInit, ledger),
+                            Stmt::Expr(expr) => parse_expr(*expr.expr, ExecContext::LedgerInit, ledger),
                             _ => Err(ErrorMessage::NoConstructorBody),
                         })
                         .collect::<Result<Vec<ContractItem>, ErrorMessage>>()?;
@@ -170,12 +170,12 @@ fn parse_ledger(
 }
 
 fn parse_expr(
-    expr: ExprStmt,
+    expr: Expr,
     exec_context: ExecContext,
     ledger: &mut CompactLedger,
 ) -> Result<ContractItem, ErrorMessage> {
     // println!("--Expr {:#?}", expr);
-    match *expr.expr {
+    match expr {
         Expr::Assign(assign_expr) => {
             let (left, right) = (assign_expr.left, assign_expr.right);
             match left {
@@ -393,6 +393,7 @@ fn parse_expr(
                                             }
                                         }
                                         CompactType::Void => Err(ErrorMessage::InvalidLedgerType("Void".to_string())),
+                                        CompactType::Boolean => todo!("Handle Boolean type in ledger properties"),
                                     }
                                 }
                             }
@@ -406,11 +407,88 @@ fn parse_expr(
                 _ => todo!("Handle other assign targets when parsing expression"),
             }
         }
+        Expr::Call(call_expr) => {
+            // function call
+            match call_expr.callee {
+                Callee::Expr(expr) => {
+                    // member expression: https://stackoverflow.com/questions/47972903/difference-between-callexpression-and-memberexpression
+                    let res = parse_expr(*expr, exec_context, ledger);
+                    println!("--Call Expr {:#?}", res);
+
+                    todo!("Handle call expressions when parsing expression")
+                }
+                Callee::Super(_) => {
+                    todo!("Handle super call expressions when parsing expression")
+                }
+                Callee::Import(_) => {
+                    todo!("Handle import call expressions when parsing expression")
+                }
+            }
+        }
+        Expr::Member(member_expr) => {
+            let res = parse_expr(*member_expr.obj, exec_context, ledger)?;
+            println!("--Obj Expr {:#?}", res);
+            match res.kind {
+                ContractItemKind::This => {
+                    // the following property must be "ledger"
+                    // TODO: allow other properties after "this" in a method call
+                    todo!("Handle member expressions after 'this' when parsing expression")
+                }
+                _ => todo!("Handle member expressions when parsing expression")
+            }
+        }
+        Expr::This(_) => match exec_context {
+            ExecContext::Circuit => Ok(ContractItem::new(ContractItemKind::This, 1, vec![])),
+            _ => Err(ErrorMessage::InvalidThisContext),
+        },
         _ => todo!("Handle other expressions when parsing expression"),
     }
 }
 
 fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<Vec<ContractItem>, ErrorMessage> {
+    // verifies that the contract has a property called "ledger" of type "Ledger"
+    let class_props = class_decl
+        .clone()
+        .class
+        .body
+        .into_iter()
+        .filter(|class_member| class_member.is_class_prop())
+        .map(|class_member| class_member.class_prop().unwrap())
+        .collect::<Vec<ClassProp>>();
+    if class_props.len() == 0 {
+        return Err(ErrorMessage::MissingLedgerProperty);
+    } else if class_props.len() > 1 {
+        return Err(ErrorMessage::TooManyContractProperties);
+    } else {
+        // checks that the property is called "ledger" and implements the Ledger class
+        let ledger_prop = class_props.get(0).unwrap();
+        match ledger_prop.clone().key.ident() {
+            Some(ident) => {
+                let prop_name = ident.sym.to_string();
+                if prop_name != "ledger" {
+                    return Err(ErrorMessage::MissingLedgerProperty);
+                } else {
+                    match &ledger_prop.type_ann {
+                        Some(type_ann) => match type_ann.type_ann.as_ts_type_ref() {
+                            None => return Err(ErrorMessage::MissingLedgerPropertyAnnotation),
+                            Some(ts_type_ref) => {
+                                match ts_type_ref.type_name.clone().ident() {
+                                    None => return Err(ErrorMessage::MissingLedgerPropertyAnnotation),
+                                    Some(type_name) => {
+                                        if type_name.sym.to_string() != "Ledger" {
+                                            return Err(ErrorMessage::MissingLedgerPropertyAnnotation);
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        None => return Err(ErrorMessage::MissingPropTypeAnnotation),
+                    }
+                }
+            },
+            None => return Err(ErrorMessage::MissingLedgerProperty),
+        }
+    }
     // finds the methods of the contract class
     let methods = class_decl
         .clone()
@@ -421,7 +499,7 @@ fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<V
         .map(|class_member| class_member.method().unwrap())
         .collect::<Vec<ClassMethod>>();
 
-    println!("--Methods {:#?}", methods);
+    // println!("--Methods {:#?}", methods);
     let circuits = methods
         .into_iter()
         .map(|method| {
@@ -480,15 +558,37 @@ fn parse_contract(ledger: &mut CompactLedger, class_decl: ClassDecl) -> Result<V
             }?;
             circuit_children.push(ContractItem::new(ContractItemKind::CircuitReturnType(return_type), 0, vec![]));
             // checks the body of the circuit
-
+            match method.function.body {
+                None => Err(ErrorMessage::MissingMethodBody(method_name.to_string())),
+                Some(body) => {
+                    if body.stmts.len() == 0 {
+                        Err(ErrorMessage::MissingMethodBody(method_name.to_string()))
+                    } else {
+                        let body_items = body
+                            .stmts
+                            .into_iter()
+                            .map(|stmt| match stmt {
+                                Stmt::Expr(expr) => parse_expr(*expr.expr, ExecContext::Circuit, ledger),
+                                _ => Err(ErrorMessage::InvalidMethodBody(method_name.to_string())),
+                            })
+                            .collect::<Result<Vec<ContractItem>, ErrorMessage>>()?;
+                        circuit_children = [circuit_children.clone(), body_items].concat();
+                        Ok(())
+                    }
+                }
+            }?;
+            
             let circuit_item = match method.accessibility {
                 Some(accessibility) => match accessibility {
-                    Accessibility::Public => Ok(ContractItem::new(ContractItemKind::CircuitExport(method_name.to_string()), 0, circuit_children)),
-                    Accessibility::Private => Ok(ContractItem::new(ContractItemKind::CircuitInternal(method_name.clone()), 0, circuit_children)),
+                    Accessibility::Public if method.is_static == false => 
+                    Ok(ContractItem::new(ContractItemKind::CircuitExport(method_name.to_string()), 0, circuit_children)),
+                    Accessibility::Private if method.is_static == false => 
+                    Ok(ContractItem::new(ContractItemKind::CircuitInternal(method_name.clone()), 0, circuit_children)),
                     _ => Err(ErrorMessage::Custom(format!("Method {} has unknown accessibility", method_name))),
                 },
                 None => Err(ErrorMessage::InaccessibleMethod(method_name)),
             }?;
+
             return Ok(circuit_item);
         })
         .collect::<Result<Vec<ContractItem>, ErrorMessage>>()?;
